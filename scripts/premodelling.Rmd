@@ -1,0 +1,164 @@
+---
+title: "Preprocessing"
+output: html_notebook
+---
+
+# Pre-processing
+```{r}
+library(tidyverse)
+library(astsa)
+library(scales)
+```
+
+```{r}
+e_df = read_csv('../data/unprocessed/data.csv')
+summary(e_df)
+```
+
+
+```{r}
+e_df %>% head()
+```
+```{r}
+e_df$date = as.Date(e_df$date)
+
+e_df %>% group_by(date) %>% summarize(len = length(date)) %>% ggplot(aes(x=len)) + geom_histogram(bins=50,col='black', fill='white') + ggtitle('Histogram of amount of earthquakes per day') + xlab('number of earthquakes per day')
+```
+
+Fill in the missing dates with N/A values:
+```{r}
+#make a df of the complete dates from 2008-11-01 to 2022-09-26
+dates = tibble(seq(as.Date("2008-11-01"), as.Date("2022-09-26"), by="days"))
+colnames(dates) = 'date'
+
+#make sure each date is available, and fill with NA
+newdf = merge(e_df, dates, by='date',all.y = TRUE, sort=TRUE)
+
+missing_dates = c(newdf %>% filter(is.na(magnitude)) %>% select(date))
+
+missing_percent = percent(length(missing_dates$date)/length(dates$date))
+
+cat('Percentage of dates that have N/A values:', missing_percent, 'of', length(dates$date),'dates.')
+
+#take average of adjacent earthquakes in time
+```
+
+Because of this excess in missing dates, let's take the monthly average. I have tried running it daily with this much missing data and there's lots of problems.
+
+```{r}
+more1count = e_df %>% group_by(date) %>% summarize(len = length(date)) %>% filter(len>1) %>% nrow()
+perc1count = percent(more1count/length(dates$date))
+
+cat('Percentage of dates that have more than 1 earthquakes:', perc1count, 'of', length(dates$date),'dates.')
+```
+
+# Feature Engineering
+Creating year and quarters and month_year variables:
+```{r}
+newdf = newdf %>% 
+  
+  #getting the year from date
+  mutate(year = as.integer(format(date,'%Y'))) %>%
+  
+  #getting the month from date
+  mutate(month = as.integer(format(date,'%m'))) %>%
+  
+  #creating magnitude categories
+  mutate(quarter = factor(case_when(month < 4 ~ 1,
+                             month < 7 ~ 2,
+                             month < 10 ~ 3,
+                             month < 13 ~ 4), levels=c(1,2,3,4))) %>%
+  
+  
+  #getting month_year
+  mutate(y_m = paste0(year, '-',month)) %>% 
+  mutate(mag_cat = factor(case_when(magnitude < 2.5 ~ 'very weak',
+               magnitude <= 5.4 ~ 'weak',
+               magnitude <= 6 ~'medium',
+               magnitude <= 6.9 ~ 'strong',
+               magnitude <= 7.9 ~ 'very strong',
+               magnitude > 7.9 ~ 'extreme')))
+
+
+newdf %>% head()
+```
+
+Distribution of count values of month_year
+```{r}
+newdf %>% group_by(y_m) %>% summarize(count = n()) %>% ggplot(aes(x=y_m,y=count)) + geom_bar(stat='identity',aes(fill=count)) + ggtitle('Distribution of count in each month_year')
+```
+Finding out what's the largest count
+```{r}
+newdf %>% group_by(y_m) %>% summarize(count = n()) %>% filter(count == max(count))
+```
+
+Distribution of magnitude in each month_year
+```{r}
+newdf %>% group_by(y_m) %>% summarize(mag_max = max(magnitude)) %>% ggplot(aes(x=y_m,y=mag_max)) + geom_bar(stat='identity',aes(fill=mag_max)) + ggtitle('Distribution of magnitude in each month_year')
+```
+
+The month_year 8 2018 has 2297 counts
+The lombok earthquake
+
+```{r}
+cat('The number of unique month_year is:', newdf %>% select(y_m) %>% unique() %>% nrow())
+```
+
+The dataframe we're going to use
+```{r}
+m_df = newdf %>% group_by(y_m) %>% filter(magnitude == max(magnitude, na.rm=TRUE))
+m_df
+```
+I noticed that there are missing y_m in the data.
+
+List of total y_m and merge with m_df
+```{r}
+list_my = newdf %>% select(y_m) %>% unique() %>% select(y_m)
+
+#make sure each date is available, and fill with NA
+m_df = merge(m_df, list_my, by='y_m',all.y = TRUE, sort=TRUE)
+
+m_df %>% filter(is.na(magnitude)) %>% pull(y_m)
+```
+Wow! These months have no recorded earthquakes. Maybe because of recording error or holidays.
+
+For SARIMA, we need to impute these!
+Let's get the list of yearly average and impute these with a bit of noise.
+```{r}
+#get yearly averages
+year_avg = m_df  %>%  
+  group_by(year) %>%
+  summarize(y_mean = mean(magnitude,na.rm=TRUE))
+
+year_avg %>% ggplot(aes(x=year,y=y_mean, fill=y_mean)) + geom_bar(stat='identity') + ggtitle('Yearly averages of earthquakes')
+```
+```{r}
+ggplot(na.omit(m_df),aes(x=longitude, y=latitude)) + 
+  geom_point(shape=24,aes(fill=mag_cat,alpha=mag_cat)) + 
+  scale_alpha_manual(values=c(1,0.5,0.4,0.3,0.2,0.1)) + ggtitle('Spatial plot of earthquakes')
+```
+use year_avg to impute the data
+```{r}
+#for reprodudibility
+set.seed(123)
+
+#get year using regex
+m_df = m_df %>% mutate(year = as.integer(sub('-(.+)', '',y_m))) %>% 
+  mutate(month = as.integer(sub('(.+)-','',y_m)))
+
+#impute the data
+m_df_imputed = m_df %>% mutate(magnitude = ifelse(is.na(magnitude), year_avg %>% filter(year==year) %>% pull(y_mean) + rnorm(1,mean=0,sd=1),magnitude)) %>%   
+  mutate(mag_cat = factor(case_when(magnitude < 2.5 ~ 'very weak',
+               magnitude <= 5.4 ~ 'weak',
+               magnitude <= 6 ~'medium',
+               magnitude <= 6.9 ~ 'strong',
+               magnitude <= 7.9 ~ 'very strong',
+               magnitude > 7.9 ~ 'extreme')))
+```
+
+
+```{r}
+write_csv(m_df, file='../data/processed/month_df.csv')
+write_csv(m_df_imputed, file='../data/processed/month_df_imputed.csv')
+```
+

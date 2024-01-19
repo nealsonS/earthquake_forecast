@@ -1,0 +1,327 @@
+---
+title: "Modelling"
+output: html_notebook
+---
+
+#### Packages
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(ggplot2)
+library(tseries)
+library(ggfortify)
+library(astsa)
+library(gridExtra)
+library(forecast)
+```
+
+#### Loading the datasets
+
+```{r}
+#monthly data without imputations
+m_df = read_csv('../data/processed/month_df.csv')
+
+#monthly data with imputations
+i_df = read_csv('../data/processed/month_df_imputed.csv')
+```
+
+# SARIMA
+
+For SARIMA, we will use the imputed data
+
+## Train and Test split
+```{r}
+split_val = 0.7
+t_split = initial_time_split(i_df, prop=split_val)
+t_train = training(t_split)
+t_test = testing(t_split)
+
+#get the min and max of start dates and end dates
+train_date_min = c(t_train %>% head(1) %>% pull(year), t_train %>% head(1) %>% pull(month))
+train_date_max = c(t_train %>% tail(1) %>% pull(year), t_train %>% tail(1) %>% pull(month))
+test_date_min = c(t_test %>% head(1) %>% pull(year), t_test %>% head(1) %>% pull(month))
+test_date_max = c(t_test %>% tail(1) %>% pull(year), t_test %>% tail(1) %>% pull(month))
+
+train_ts = ts(t_train %>% pull(magnitude), start=train_date_min,end=train_date_max,frequency=12)
+test_ts = ts(t_test %>% pull(magnitude), start=test_date_min,end=test_date_max,frequency=12)
+
+#boxcox transformation
+lambda = BoxCox.lambda(train_ts) #find optimal lambda for train_ts
+bctrain = BoxCox(train_ts,lambda)
+
+dtrain = diff(train_ts)
+dbctrain = diff(bctrain)
+ddbctrain = diff(dbctrain,12)
+
+```
+
+*Time series Plots*:
+```{r}
+train_plot = ggplot2::autoplot(train_ts, main='Monthly Earthquake data', ts.colour='black', ylab='magnitude',xlab='year')
+bctrain_plot = ggplot2::autoplot(bctrain, main='BoxCox Monthly Earthquake data', ts.colour='black', ylab='BoxCox(magnitude)',xlab='year')
+dtrain_plot = ggplot2::autoplot(dtrain, main='Differenced BoxCox Monthly Earthquake data', ts.colour='black', ylab='diff(log(magnitude))',xlab='year')
+ddtrain_plot = ggplot2::autoplot(ddbctrain, main='12 Differenced BoxCox Monthly Earthquake data', ts.colour='black', ylab='diff(log(magnitude))',xlab='year')
+
+grid.arrange(train_plot,bctrain_plot,dtrain_plot,ddtrain_plot)
+```
+From the graph, we can see that the graph doesn't look stationary, and seems to have a slight trend.
+But after taking a BoxCox of the earthquake data, it looks more stationary, but there seems to still be trend
+And after differencing the boxcox data, the data doesn't have much trend anymore.
+This looks like what we're going to use later.
+
+*Augmented Dickey-Fuller test*:
+```{r}
+adf.test(train_ts)
+```
+
+From the Augmented Dickey-Fuller Test, we can say that there exists a unit root on the time series.
+This means that we reject the null hypothesis and conclude that there the time series is stationary, and possible with a trend
+
+*QQ-plot:*
+```{r}
+qqnorm(train_ts)
+qqline(train_ts)
+```
+From the data, it's slightly skewed at the tails, but it looks relatively normal.
+
+*ACF & PACF*:
+```{r}
+train_acf2 = acf2(train_ts, main='ACF & PACF of time series',12*8)
+```
+
+```{r}
+bctrain_acf2 = acf2(bctrain,main='ACF & PACF of boxcox time series',12*8)
+```
+
+```{r}
+dtrain_acf2 = acf2(dtrain,main='ACF & PACF of differenced boxcox time series',12*8)
+```
+```{r}
+ddtrain_acf = acf2(ddbctrain,main='ACF & PACF of 12 differenced boxcox time series',12*8)
+```
+
+From these ACF and PACF, there are some lags worth noting:
+
+Boxcox time series:
+1. ACF seems to tail off
+2. PACF seems to cut off at lag 24 (2 years)
+
+This implies possible models: 
+AR(24)
+
+Differenced time series:
+1. ACF seems to cut off at lag 24 (2 years)
+2. PACF seems to tail off 
+
+This implies possible models:
+MA(24)
+
+Possible models: 
+
+12 Differenced time series:
+1. ACF seems to cut off at lag 12 (1 year)
+2. PACF seems to tail off
+
+This implies possible models:
+MA(12)
+
+Note that all the ACF and PACF doesn't show any seasonality.
+*Periodogram:*
+
+Time series:
+```{r}
+par(mfrow=c(2,1))
+k=kernel('modified.daniell',3)
+e.per = mvspec(bctrain, taper=0, log="no", main='Periodogram')
+e.per.smo = mvspec(bctrain, k,taper=0.5, log="no", main='Smoothed Periodogram | taper = 0.5')
+```
+The periodogram shows that there doesn't seem to be any periodic activity.
+
+## Fitting SARIMA models
+
+*AR(24) on bctrain*
+```{r}
+set.seed(123)
+#AR(2)
+s_fit_1 = sarima(bctrain, 24,0,0)
+```
+```{r}
+s_fit_1
+```
+It seems like this fit quite well. The residuals doesn't have a clear pattern! 
+This is good! The standard residuals are also relatively normal.
+
+Let's try with seasonality:
+
+*AR(24) with seasonality (P=0, Q=1, s=24):*
+```{r}
+set.seed(123)
+s_fit1_seasonal = sarima(bctrain, 24,0,0,P=0,D=1,Q=1,S=12)
+```
+
+```{r}
+s_fit1_seasonal
+```
+The p-values for Ljung-Box statistics aren't significant, and there seems to be a trend on the residuals.
+This could mean that the model doesn't fit or that there isn't a seasonality portion.
+
+*MA(24) on differenced time series*
+```{r}
+s_fit_2 = sarima(dtrain, 0,0,24)
+```
+```{r}
+s_fit_2
+```
+
+This looks even better! The residuals looks more and more like white noise. 
+And the residuals ACF looks like white noise and p-values are significant.
+
+**MA(12) on 12 differenced time series:**
+```{r}
+s_fit_3= sarima(ddbctrain, 0,0,12)
+```
+
+```{r}
+s_fit_3
+```
+From the residuals ACF, we can see that there is a significant peak at Residuals ACF, and that the p-values for the LB-statistic aren't significant.
+This shows a bad fit for the earthquake data.
+
+So far the model MA(24) works really well with the data. Let's try AUTO ARIMA on the differenced time series.
+
+*Auto Arima*:
+```{r}
+s_fit_auto = auto.arima(dtrain, seasonal=TRUE,num.cores = 8,approximation=FALSE)
+s_fit_auto
+```
+
+```{r}
+s_fit_auto_sarima = sarima(dtrain,0,0,1)
+```
+```{r}
+s_fit_auto_sarima
+```
+The autoarima shows that the model achieved a lower AIC than our MA(24) model, but
+the ACF of residuals doesn't seem like white noise and p-values aren't all significant.
+
+We will stick with the MA(24) model. Let's use it to forecast and calculate accuracy.
+
+*Forecasting:*
+
+Let's try forecasting 5 months.
+```{r}
+set.seed(123)
+sarima.for(dtrain, 5, 0,0,24)
+
+```
+
+
+Let's compare to our testing set to check prediction error
+```{r}
+set.seed(123)
+
+#diff and boxcox testing set
+dtest = diff(BoxCox(test_ts,lambda))
+
+n= length(dtest)
+#get the predictions for 50 months to check with testing set
+s_fit_2.for = sarima.for(dtrain, n, 0,0,24)
+
+df_pred = tibble(actual=c(dtest),pred=c(s_fit_2.for$pred))
+```
+
+RMSE:
+```{r}
+rmse(df_pred, truth=actual, estimate=pred)
+```
+The RMSE is not bad! Let's try for the AUTOARIMA.
+
+*AUTOARIMA Forecasting:*
+```{r}
+set.seed(123)
+
+#diff and boxcox testing set
+dtest = diff(BoxCox(test_ts,lambda))
+
+n= length(dtest)
+#get the predictions for 50 months to check with testing set
+s_fit_auto.for = sarima.for(dtrain, n, 0,0,1)
+
+df_pred_auto = tibble(actual=c(dtest),pred=c(s_fit_auto.for$pred))
+```
+
+```{r}
+rmse(df_pred_auto, truth=actual, estimate=pred)
+```
+It is slightly worse. Thus our best fit model is SARIMA.
+
+# Local Level State Space Model
+
+Since state space model can work with missing data, let's not force any imputations and use our unimputed data.
+
+```{r}
+split_val = 0.7
+t_split = initial_time_split(m_df, prop=split_val)
+t_train = training(t_split)
+t_test = testing(t_split)
+
+#get the min and max of start dates and end dates
+train_date_min = c(t_train %>% head(1) %>% pull(year), t_train %>% head(1) %>% pull(month))
+train_date_max = c(t_train %>% tail(1) %>% pull(year), t_train %>% tail(1) %>% pull(month))
+test_date_min = c(t_test %>% head(1) %>% pull(year), t_test %>% head(1) %>% pull(month))
+test_date_max = c(t_test %>% tail(1) %>% pull(year), t_test %>% tail(1) %>% pull(month))
+
+train_ts2 = ts(t_train %>% pull(magnitude), start=train_date_min,end=train_date_max,frequency=12)
+test_ts2 = ts(t_test %>% pull(magnitude), start=test_date_min,end=test_date_max,frequency=12)
+
+#boxcox transformation
+lambda2 = BoxCox.lambda(train_ts2) #find optimal lambda for train_ts
+bctrain2 = BoxCox(train_ts2,lambda2)
+
+dtrain2 = diff(train_ts)
+dbctrain2 = diff(bctrain)
+ddbctrain2 = diff(dbctrain,12)
+```
+
+Filtering and Smoothing
+```{r}
+#initialize initial parameters
+mu0 = 0
+A=1
+Sigma0 = 1
+Phi = 1
+sQ = 1
+sR = 1
+#estimating parameters using EM algorithm
+par = EM(bctrain2, A=A, mu0=mu0, Sigma0 = Sigma0, Phi=0.01, Q=0.01, R=0.01)
+
+#filtering and smoothing
+ks = Ksmooth(bctrain2, A=A, mu0=par$mu0, Sigma0 = par$Sigma0, Phi=par$Phi, sQ=par$Q, sR=par$R)
+```
+
+```{r}
+#code from pg. 302 from textbook
+
+Time = 1:length(bctrain2)
+
+plot(Time, bctrain2, main='Predict',ylim=c(-15,50))
+lines(ks$Xp)
+lines(ks$Xp+2*sqrt(ks$Pp), lty=2, col=4)
+lines(ks$Xp-2*sqrt(ks$Pp), lty=2, col=4)
+```
+```{r}
+plot(Time, bctrain2, main='Filter',ylim=c(-15,50))
+lines(ks$Xf)
+lines(ks$Xf+2*sqrt(ks$Pf), lty=2, col=4)
+lines(ks$Xf-2*sqrt(ks$Pf), lty=2, col=4)
+```
+
+```{r}
+plot(Time, bctrain2,ylim=c(-15,50),
+main='Smooth')
+lines(ks$Xs)
+lines(ks$Xs+2*sqrt(ks$Ps), lty=2, col=4)
+lines(ks$Xs-2*sqrt(ks$Ps), lty=2, col=4)
+```
+
+
